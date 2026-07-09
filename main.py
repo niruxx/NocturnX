@@ -27,18 +27,47 @@ SUPPORTED = ("Windows", "Linux", "BSD", "macOS")
 LOG_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output.out")
 SETTINGS_FILE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patch_settings.json")
 
-PALETTE = {
-    "bg": "#f4f5fb",
-    "card": "#ffffff",
-    "border": "#e2e8f0",
-    "accent": "#4f46e5",
-    "accent_dark": "#4338ca",
-    "text": "#1e293b",
-    "muted": "#64748b",
-    "success": "#16a34a",
-    "error": "#dc2626",
-    "warning": "#b45309",
+# Material You (Material Design 3) tonal palettes — seed color: purple (#6750A4)
+LIGHT_PALETTE = {
+    "bg": "#FEF7FF",              # surface / surface-dim
+    "card": "#F7F2FA",            # surface container
+    "border": "#CAC4D0",          # outline-variant
+    "accent": "#6750A4",          # primary
+    "accent_dark": "#4F378B",     # primary (pressed/hover tonal step)
+    "accent_container": "#EADDFF",  # primary container
+    "on_accent": "#FFFFFF",       # text/icons drawn on top of "accent"
+    "on_accent_container": "#21005D",
+    "text": "#1D1B20",            # on-surface
+    "muted": "#49454F",           # on-surface-variant
+    "success": "#146C2E",         # tertiary-ish green, M3-friendly contrast
+    "error": "#B3261E",           # error
+    "warning": "#7D5700",         # on tonal warning container
+    "warning_container": "#FFE08A",
 }
+
+DARK_PALETTE = {
+    "bg": "#141218",              # surface (dark)
+    "card": "#211F26",            # surface container (dark)
+    "border": "#49454F",          # outline-variant (dark)
+    "accent": "#D0BCFF",          # primary (dark theme uses a light tone)
+    "accent_dark": "#B69DF8",     # primary (pressed/hover tonal step)
+    "accent_container": "#4F378B",  # primary container (dark)
+    "on_accent": "#381E72",       # text/icons drawn on top of "accent"
+    "on_accent_container": "#EADDFF",
+    "text": "#E6E0E9",            # on-surface (dark)
+    "muted": "#CAC4D0",           # on-surface-variant (dark)
+    "success": "#81D993",
+    "error": "#F2B8B5",
+    "warning": "#FFDEA1",
+    "warning_container": "#4A3800",
+}
+
+PALETTE = LIGHT_PALETTE
+
+
+def _set_active_palette(dark):
+    global PALETTE
+    PALETTE = DARK_PALETTE if dark else LIGHT_PALETTE
 
 
 def _write_log_line(line):
@@ -56,14 +85,30 @@ def _load_selections():
         return {}
 
 
+def _write_settings(settings):
+    try:
+        with open(SETTINGS_FILE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(settings, fh, indent=2, sort_keys=True)
+    except OSError:
+        pass
+
+
 def _save_selection(os_name, patch_name, enabled):
     selections = _load_selections()
     selections.setdefault(os_name, {})[patch_name] = enabled
-    try:
-        with open(SETTINGS_FILE_PATH, "w", encoding="utf-8") as fh:
-            json.dump(selections, fh, indent=2, sort_keys=True)
-    except OSError:
-        pass
+    _write_settings(selections)
+
+
+def _load_theme():
+    """Return 'dark' or 'light' from the settings file's top-level "theme" key."""
+    theme = _load_selections().get("theme")
+    return theme if theme in ("light", "dark") else "dark"
+
+
+def _save_theme(theme):
+    selections = _load_selections()
+    selections["theme"] = theme
+    _write_settings(selections)
 
 
 # --------------------------------------------------------------------------
@@ -84,6 +129,50 @@ def detect_os():
     if system == "linux" or plat.startswith("linux"):
         return "Linux"
     return None
+
+
+# --------------------------------------------------------------------------
+# Window chrome theming (Windows only — DWM border/title bar colors)
+# --------------------------------------------------------------------------
+
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+_DWMWA_BORDER_COLOR = 34
+_DWMWA_CAPTION_COLOR = 35
+_DWMWA_TEXT_COLOR = 36
+
+
+def _colorref(hex_color):
+    """Convert a "#RRGGBB" string to a Windows COLORREF (0x00BBGGRR) int."""
+    hex_color = hex_color.lstrip("#")
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+    return r | (g << 8) | (b << 16)
+
+
+def _apply_window_chrome(root, dark):
+    """Tint the native window border/title bar to match the app theme.
+
+    Only supported on Windows 11 (DWMWA_BORDER_COLOR/CAPTION_COLOR are
+    22H2+); silently does nothing elsewhere or on older Windows builds.
+    """
+    if platform.system() != "Windows":
+        return
+    try:
+        # The toplevel's real HWND doesn't exist until Tk has realized/mapped
+        # the window — querying it any earlier makes GetParent return NULL
+        # and every DwmSetWindowAttribute call below silently no-op.
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        dwmapi = ctypes.windll.dwmapi
+        for attribute, value in (
+            (_DWMWA_USE_IMMERSIVE_DARK_MODE, 1 if dark else 0),
+            (_DWMWA_BORDER_COLOR, _colorref(PALETTE["accent"])),
+            (_DWMWA_CAPTION_COLOR, _colorref(PALETTE["bg"])),
+            (_DWMWA_TEXT_COLOR, _colorref(PALETTE["text"])),
+        ):
+            c_value = ctypes.c_int(value)
+            dwmapi.DwmSetWindowAttribute(hwnd, attribute, ctypes.byref(c_value), ctypes.sizeof(c_value))
+    except OSError:
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -271,6 +360,19 @@ PATCHES = {
 # GUI
 # --------------------------------------------------------------------------
 
+def _body_font_family():
+    """Prefer Roboto (Material's type family); fall back to a Segoe UI variant."""
+    try:
+        import tkinter.font as tkfont
+        families = set(tkfont.families())
+    except Exception:
+        families = set()
+    for candidate in ("Roboto", "Segoe UI Variable Text", "Segoe UI"):
+        if candidate in families:
+            return candidate
+    return "Segoe UI"
+
+
 def _configure_style(root):
     style = ttk.Style(root)
     try:
@@ -278,41 +380,56 @@ def _configure_style(root):
     except tk.TclError:
         pass
 
+    font_family = _body_font_family()
+
     root.configure(background=PALETTE["bg"])
 
     style.configure("TFrame", background=PALETTE["bg"])
     style.configure("Card.TFrame", background=PALETTE["card"])
-    style.configure("Banner.TFrame", background="#fef3c7")
+    style.configure("Banner.TFrame", background=PALETTE["warning_container"])
 
     style.configure("TLabel", background=PALETTE["bg"], foreground=PALETTE["text"],
-                     font=("Segoe UI", 10))
+                     font=(font_family, 10))
     style.configure("Card.TLabel", background=PALETTE["card"], foreground=PALETTE["text"],
-                     font=("Segoe UI", 10, "bold"))
+                     font=(font_family, 10, "bold"))
     style.configure("CardDesc.TLabel", background=PALETTE["card"], foreground=PALETTE["muted"],
-                     font=("Segoe UI", 9))
-    style.configure("Muted.TLabel", foreground=PALETTE["muted"], font=("Segoe UI", 9))
-    style.configure("Banner.TLabel", background="#fef3c7", foreground=PALETTE["warning"],
-                     font=("Segoe UI", 9, "bold"))
-    style.configure("Title.TLabel", font=("Segoe UI", 17, "bold"), foreground=PALETTE["text"])
-    style.configure("Subtitle.TLabel", font=("Segoe UI", 10), foreground=PALETTE["muted"])
-    style.configure("Badge.TLabel", background=PALETTE["accent"], foreground="white",
-                     font=("Segoe UI", 14, "bold"), anchor="center")
+                     font=(font_family, 9))
+    style.configure("Muted.TLabel", foreground=PALETTE["muted"], font=(font_family, 9))
+    style.configure("Banner.TLabel", background=PALETTE["warning_container"], foreground=PALETTE["warning"],
+                     font=(font_family, 9, "bold"))
+    style.configure("Title.TLabel", font=(font_family, 17, "bold"), foreground=PALETTE["text"])
+    style.configure("Subtitle.TLabel", font=(font_family, 10), foreground=PALETTE["muted"])
+    style.configure("Badge.TLabel", background=PALETTE["accent"], foreground=PALETTE["on_accent"],
+                     font=(font_family, 14, "bold"), anchor="center")
     style.configure("Selected.TLabel", background=PALETTE["card"], foreground=PALETTE["accent"],
-                     font=("Segoe UI", 8, "bold"))
+                     font=(font_family, 8, "bold"))
 
-    style.configure("Accent.TButton", font=("Segoe UI", 10, "bold"), padding=(14, 8),
-                     background=PALETTE["accent"], foreground="white", borderwidth=0)
+    # Filled buttons (M3 "Filled button" — primary color, no border, tonal hover/press)
+    style.configure("Accent.TButton", font=(font_family, 10, "bold"), padding=(16, 10),
+                     background=PALETTE["accent"], foreground=PALETTE["on_accent"], borderwidth=0,
+                     focuscolor=PALETTE["accent"])
     style.map("Accent.TButton",
-              background=[("active", PALETTE["accent_dark"]), ("disabled", "#a5b4fc")])
-    style.configure("TButton", font=("Segoe UI", 9), padding=(10, 6))
-    style.configure("TCheckbutton", background=PALETTE["card"], font=("Segoe UI", 10, "bold"),
+              background=[("active", PALETTE["accent_dark"]), ("disabled", PALETTE["accent_container"])],
+              foreground=[("disabled", PALETTE["on_accent_container"])])
+
+    # Outlined/tonal button (M3 "Outlined button")
+    style.configure("TButton", font=(font_family, 9), padding=(12, 7),
+                     background=PALETTE["card"], foreground=PALETTE["accent"],
+                     bordercolor=PALETTE["border"], borderwidth=1, focuscolor=PALETTE["accent"])
+    style.map("TButton",
+              background=[("active", PALETTE["accent_container"])],
+              bordercolor=[("active", PALETTE["accent"])])
+
+    style.configure("TCheckbutton", background=PALETTE["card"], font=(font_family, 10, "bold"),
                      foreground=PALETTE["text"])
-    style.map("TCheckbutton", background=[("active", PALETTE["card"])])
+    style.map("TCheckbutton", background=[("active", PALETTE["card"])],
+              foreground=[("selected", PALETTE["accent"])])
 
     style.configure("TLabelframe", background=PALETTE["bg"], bordercolor=PALETTE["border"])
     style.configure("TLabelframe.Label", background=PALETTE["bg"], foreground=PALETTE["muted"],
-                     font=("Segoe UI", 9, "bold"))
-    style.configure("Vertical.TScrollbar", background=PALETTE["bg"])
+                     font=(font_family, 9, "bold"))
+    style.configure("Vertical.TScrollbar", background=PALETTE["bg"], troughcolor=PALETTE["bg"],
+                     bordercolor=PALETTE["bg"], arrowcolor=PALETTE["muted"])
     return style
 
 
@@ -320,14 +437,60 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("920x860")
+        self._center_window(920, 860)
         self.minsize(900, 820)
+
+        self.dark_mode = _load_theme() == "dark"
+        _set_active_palette(self.dark_mode)
         _configure_style(self)
+        _apply_window_chrome(self, self.dark_mode)
+
+        self.attributes("-alpha", 0.0)
+        self.protocol("WM_DELETE_WINDOW", self._close_with_fade)
 
         self._frame = None
+        self._screen_state = None
         detected = detect_os()
         if detected:
             self.show_patch_screen(detected, auto=True)
+        else:
+            self.show_select_screen()
+
+        self._fade(target=1.0)
+
+    def _center_window(self, width, height):
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        x = (screen_width - width) // 2
+        y = (screen_height - height) // 2
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+    def _fade(self, target, step=0.08, delay_ms=15, on_done=None):
+        alpha = self.attributes("-alpha")
+        if target > alpha:
+            alpha = min(alpha + step, target)
+        else:
+            alpha = max(alpha - step, target)
+        self.attributes("-alpha", alpha)
+        if alpha != target:
+            self.after(delay_ms, self._fade, target, step, delay_ms, on_done)
+        elif on_done is not None:
+            on_done()
+
+    def _close_with_fade(self):
+        self._fade(target=0.0, on_done=self.destroy)
+
+    def toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        _set_active_palette(self.dark_mode)
+        _configure_style(self)
+        _apply_window_chrome(self, self.dark_mode)
+        _save_theme("dark" if self.dark_mode else "light")
+
+        kind = self._screen_state[0]
+        if kind == "patch":
+            _, os_name, auto = self._screen_state
+            self.show_patch_screen(os_name, auto=auto)
         else:
             self.show_select_screen()
 
@@ -338,9 +501,11 @@ class App(tk.Tk):
         self._frame.pack(fill="both", expand=True)
 
     def show_select_screen(self):
+        self._screen_state = ("select",)
         self._swap(OSSelectFrame(self))
 
     def show_patch_screen(self, os_name, auto=False):
+        self._screen_state = ("patch", os_name, auto)
         self._swap(PatchFrame(self, os_name, auto=auto))
 
 
@@ -364,6 +529,9 @@ class OSSelectFrame(ttk.Frame):
                 self, text=os_name, width=28, style="Accent.TButton",
                 command=lambda n=os_name: master.show_patch_screen(n),
             ).pack(pady=5)
+
+        theme_text = "☀ Light Mode" if master.dark_mode else "🌙 Dark Mode"
+        ttk.Button(self, text=theme_text, command=master.toggle_theme).pack(pady=(20, 0))
 
 
 class PatchFrame(ttk.Frame):
@@ -389,6 +557,10 @@ class PatchFrame(ttk.Frame):
 
         ttk.Button(header, text="Change OS",
                    command=master.show_select_screen).pack(side="right", anchor="n")
+
+        theme_text = "☀ Light Mode" if master.dark_mode else "🌙 Dark Mode"
+        ttk.Button(header, text=theme_text,
+                   command=master.toggle_theme).pack(side="right", padx=(0, 8), anchor="n")
 
         if os_name == "Windows":
             ttk.Button(header, text="Create Windows Backup",
@@ -483,7 +655,7 @@ class PatchFrame(ttk.Frame):
         # Log output
         log_box = ttk.LabelFrame(self, text="LOG", padding=8)
         log_box.pack(fill="both", expand=True)
-        self.log = tk.Text(log_box, height=8, state="disabled", wrap="word",
+        self.log = tk.Text(log_box, height=6, state="disabled", wrap="word",
                             background=PALETTE["card"], foreground=PALETTE["text"],
                             font=("Consolas", 9), borderwidth=0, relief="flat",
                             padx=8, pady=6)
